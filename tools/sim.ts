@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { gunzipSync } from 'node:zlib';
-import { PROTOCOL, type Bot, type ChainEvent, type Hello } from '../vendor/makefun-bot.ts';
+import { PROTOCOL, type Bot, type ChainEvent, type CreateEventRecord, type Hello } from '../vendor/makefun-bot.ts';
 import { replay, type Guardrails, type SlotEvents } from './replay.ts';
 
 const kit = '/work/kit';
@@ -153,6 +153,95 @@ function positiveInteger(value: string, flag: string): number {
   return n;
 }
 
+function seed(value: string, flag: string): string {
+  if (!/^\d+$/.test(value) || BigInt(value) >= (1n << 64n)) throw new Error(`Invalid ${flag}: ${value}`);
+  return BigInt(value).toString();
+}
+
+// Round half up to the integer basis points and lamports used by replay.
+const scaleFee = (amount: bigint) => (3n * amount + 1n) / 2n;
+
+function stressFees(hello: Hello): void {
+  const fees = hello.fees;
+  fees.protocol_bps_fallback = Number(scaleFee(BigInt(fees.protocol_bps_fallback)));
+  fees.creator_bps_fallback = Number(scaleFee(BigInt(fees.creator_bps_fallback)));
+  fees.base_fee_lamports = String(scaleFee(BigInt(fees.base_fee_lamports)));
+  fees.priority_fee_lamports = String(scaleFee(BigInt(fees.priority_fee_lamports)));
+}
+
+function* withHigherTradeFees(batches: SlotEvents[]): Iterable<SlotEvents> {
+  for (const { slot, events } of batches) {
+    yield {
+      slot,
+      events: events.map((event) => event.event === 'TradeEvent' ? {
+        ...event,
+        fee_basis_points: String(scaleFee(BigInt(event.fee_basis_points))),
+        creator_fee_basis_points: String(scaleFee(BigInt(event.creator_fee_basis_points))),
+      } : event),
+    };
+  }
+}
+
+function* withTradeGaps(batches: SlotEvents[], dropSeed: string, windowIndex: number): Iterable<SlotEvents> {
+  let remaining = 0;
+  for (const { events } of batches) {
+    for (const event of events) if (event.event === 'TradeEvent') remaining++;
+  }
+  let drops = Math.round(remaining / 20);
+  for (const { slot, events } of batches) {
+    const retained = events.filter((event) => {
+      if (event.event !== 'TradeEvent') return true;
+      // Sample without replacement from this window's eligible trades.
+      const digest = sha256(`trade-gaps\0${dropSeed}\0${windowIndex}\0${remaining}`);
+      const draw = parseInt(digest.slice(0, 12), 16) / 2 ** 48;
+      const drop = draw < drops / remaining;
+      remaining--;
+      if (drop) drops--;
+      return !drop;
+    });
+    if (retained.length) yield { slot, events: retained };
+  }
+}
+
+function* withSmallerTrades(batches: SlotEvents[]): Iterable<SlotEvents> {
+  const creates = new Map<string, CreateEventRecord>();
+  for (const { slot, events } of batches) {
+    yield {
+      slot,
+      events: events.map((event) => {
+        if (event.event === 'CreateEvent') creates.set(event.mint, event);
+        if (event.event !== 'TradeEvent') return event;
+        const create = creates.get(event.mint)!;
+        const initialVq = BigInt(create.virtual_quote_reserves);
+        const initialVt = BigInt(create.virtual_token_reserves);
+        const initialRt = BigInt(create.real_token_reserves);
+        const recordedRq = BigInt(event.real_quote_reserves);
+        const recordedQuote = BigInt(event.quote_amount);
+        const recordedBeforeRq = event.is_buy ? recordedRq - recordedQuote : recordedRq + recordedQuote;
+
+        // Compress the recorded quote trajectory from creation. Keep unseen
+        // reserve moves and reconstruct token reserves on the initial curve.
+        const rq = recordedRq * 7n / 10n;
+        const beforeRq = recordedBeforeRq * 7n / 10n;
+        const vq = initialVq + rq;
+        const invariant = initialVq * initialVt;
+        const vt = invariant / vq;
+        const beforeVt = invariant / (initialVq + beforeRq);
+        const rt = initialRt - (initialVt - vt);
+        const quote = event.is_buy ? rq - beforeRq : beforeRq - rq;
+        const tokens = event.is_buy ? beforeVt - vt : vt - beforeVt;
+        return {
+          ...event,
+          quote_amount: String(quote), sol_amount: String(quote), token_amount: String(tokens),
+          virtual_quote_reserves: String(vq), virtual_sol_reserves: String(vq),
+          virtual_token_reserves: String(vt),
+          real_quote_reserves: String(rq), real_sol_reserves: String(rq), real_token_reserves: String(rt),
+        };
+      }),
+    };
+  }
+}
+
 async function main() {
   const { values } = parseArgs({
     options: {
@@ -161,6 +250,9 @@ async function main() {
       params: { type: 'string', default: '{}' },
       window: { type: 'string' },
       windows: { type: 'string' },
+      stress: { type: 'string' },
+      'failure-seed': { type: 'string' },
+      'drop-seed': { type: 'string' },
       help: { type: 'boolean' },
     },
   });
@@ -170,6 +262,12 @@ async function main() {
   }
   if (!values.strategy) throw new Error(usage);
   if (values.window !== undefined && values.windows !== undefined) throw new Error('Use either --window or --windows');
+  const stress = values.stress;
+  const scenarios = ['latency', 'fees', 'failed-tx', 'rpc-gaps', 'smaller-trades'];
+  if (stress !== undefined && !scenarios.includes(stress)) throw new Error(`--stress must be one of: ${scenarios.join(', ')}`);
+  const failureSeed = values['failure-seed'] === undefined ? undefined : seed(values['failure-seed'], '--failure-seed');
+  const dropSeed = values['drop-seed'] === undefined ? undefined : seed(values['drop-seed'], '--drop-seed');
+  if ((stress === 'rpc-gaps') !== (dropSeed !== undefined)) throw new Error('Use --drop-seed with --stress rpc-gaps');
   let count = 1;
   let selected = [0];
   if (values.windows !== undefined) {
@@ -191,12 +289,21 @@ async function main() {
   if (typeof createStrategy !== 'function') throw new Error('Strategy must export createStrategy(params)');
   const manifest = readJson<Manifest>(resolve(values.data, 'manifest.json'));
   const { hello, guardrails } = config(manifest);
+  if (failureSeed !== undefined) hello.seed = failureSeed;
+  if (stress === 'latency') hello.latency_slots = 3;
+  if (stress === 'fees') stressFees(hello);
+  if (stress === 'failed-tx') hello.fees.failed_tx_bps = 500;
+  if (stress === 'smaller-trades') hello.capital.lamports = '10000000000';
   const windows = readWindows(values.data, manifest, count, new Set(selected));
 
   const results: Awaited<ReturnType<typeof replay>>[] = [];
   for (const index of selected) {
     const { batches, endSlot } = windows.get(index)!;
-    const metrics = await replay(createStrategy(structuredClone(params)), hello, guardrails, batches, endSlot);
+    let records: Iterable<SlotEvents> = batches;
+    if (stress === 'fees') records = withHigherTradeFees(batches);
+    if (dropSeed !== undefined) records = withTradeGaps(batches, dropSeed, index);
+    if (stress === 'smaller-trades') records = withSmallerTrades(batches);
+    const metrics = await replay(createStrategy(structuredClone(params)), hello, guardrails, records, endSlot);
     results.push(metrics);
     const label = values.windows === undefined ? {} : { window: `${index + 1}/${count}` };
     console.log(JSON.stringify({ ...label, ...metrics }));

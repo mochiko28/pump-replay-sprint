@@ -6,7 +6,7 @@
 
 A pump.fun replay trading bot (agent-fun/replay/v2). It buys sharp single-sell dumps on established bonding curves that had strong
 net buying just before, adds once on a further dump, and exits at a fixed net return band or a time limit. A small set of tiny
-0.0101 SOL round trips covers the 20-coin guardrail. Strategy: `strategies/famC_m5.ts`; `tools/sim.ts` is the local replay simulator.
+0.0101 SOL round trips covers the 20-coin guardrail. Strategy: `strategies/famH_c2.ts` (dip entries on established curves, a quiet-market pause-then-buy entry, and early minimum-size coverage round trips); `tools/sim.ts` is the local replay simulator.
 
 ## Run it
 
