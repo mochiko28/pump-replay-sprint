@@ -1,1 +1,1 @@
-export { createStrategy } from './probe.ts';
+export { createStrategy } from './famC.ts';
