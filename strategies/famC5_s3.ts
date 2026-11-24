@@ -1,0 +1,314 @@
+import type { Bot, OrderInput } from '../vendor/makefun-bot.ts';
+
+export const DEFAULT_PARAMS = {
+  minReserveSol: 25,
+  minPriorNetSol: 5,
+  minSingleDrop: 0.04,
+  holdSlots: 112,
+  exitMove: 0.12,
+  riskSol: 0.45,
+  buySlippageBps: 200,
+  scaleInDrop: 0.02,
+};
+
+type Params = typeof DEFAULT_PARAMS;
+const SOL = 1_000_000_000;
+const MIN_ROUND_TRIP = 10_000_000n;
+// Leave room for the curve's integer fee rounding.
+const COVER_BUDGET = MIN_ROUND_TRIP + 1_000n;
+const COVER_TARGET = 21;
+const MIN_COVER_AGE = 32;
+const FLOW_SLOTS = 64;
+const MIN_SIGNAL_AGE = 64;
+const MIN_DIP_FROM_HIGH = 0.06;
+const MIN_SLOT_DROP = 0.025;
+const ENTRY_COOLDOWN = 32;
+const MAX_ALPHA_POSITIONS = 3;
+const LADDER_MULTIPLIER = 3n;
+
+type Flow = { slot: number; net: number; high: number; singleDrop: number };
+type Tape = {
+  price: number;
+  flow: Flow[];
+  firstPrice: number;
+  creator: string;
+  dipSlot: number;
+};
+type Entry = {
+  coverage: boolean;
+  exitSlot: number;
+  cost: number;
+  qualifies: boolean;
+  entryPrice: number;
+  entryFillSlot: number;
+  scaledIn: boolean;
+  creatorExit: boolean;
+  spent: bigint;
+  firstFillPrice: number;
+  ladderActive: boolean;
+  exitArmed: boolean;
+};
+
+export function createStrategy(overrides: Partial<Params> = {}): Bot {
+  const params = { ...DEFAULT_PARAMS, ...overrides };
+  const budget = BigInt(Math.floor(params.riskSol * SOL));
+  const ladderBudget = budget * LADDER_MULTIPLIER;
+  const tapes = new Map<string, Tape>();
+  const reserveOffsets = new Map<string, { quote: bigint; tokens: bigint }>();
+  const entries = new Map<string, Entry>();
+  const completed = new Set<string>();
+  const lastSignal = new Map<string, number>();
+
+  return {
+    onHello() {},
+    onBatch(state, batch) {
+      const slot = batch.slot;
+      const txFee = state.txFeeLamports();
+      const pending = new Map([...state.pending.values()].map(({ order }) => [order.mint, order]));
+      const pendingAdds = new Map<string, bigint>();
+      for (const { order } of state.pending.values()) {
+        if (order.side === 'buy' && /^(add|ladder)-/.test(order.client_id)) {
+          pendingAdds.set(order.mint, (pendingAdds.get(order.mint) ?? 0n) + BigInt(order.quote_lamports));
+        }
+      }
+      for (const fill of batch.fills) {
+        if (fill.status !== 'filled') continue;
+        if (!fill.client_id.startsWith('_writeoff_')) {
+          const offset = reserveOffsets.get(fill.mint) ?? { quote: 0n, tokens: 0n };
+          const quote = BigInt(fill.quote_lamports);
+          const fee = BigInt(fill.fee_lamports);
+          const tokens = BigInt(fill.token_amount);
+          offset.quote += fill.side === 'buy' ? quote - fee : -quote - fee;
+          offset.tokens += fill.side === 'buy' ? tokens : -tokens;
+          reserveOffsets.set(fill.mint, offset);
+        }
+        if (fill.side === 'buy') {
+          const coverage = fill.client_id.startsWith('cover-');
+          const spent = BigInt(fill.quote_lamports);
+          const cost = Number(spent + BigInt(fill.tx_fee_lamports));
+          const entry = entries.get(fill.mint);
+          const scaleIn = fill.client_id.startsWith('add-');
+          if (entry && (scaleIn || fill.client_id.startsWith('ladder-'))) {
+            entry.cost += cost;
+            entry.spent += spent;
+            entry.qualifies ||= entry.spent >= MIN_ROUND_TRIP;
+            entry.scaledIn ||= scaleIn;
+            continue;
+          }
+          const mark = batch.marks.find((item) => item.mint === fill.mint);
+          entries.set(fill.mint, {
+            coverage,
+            exitSlot: fill.slot + (coverage ? 0 : params.holdSlots),
+            cost,
+            qualifies: spent >= MIN_ROUND_TRIP,
+            entryPrice: mark ? Number(mark.virtual_quote_reserves) / Number(mark.virtual_token_reserves) : 0,
+            entryFillSlot: fill.slot,
+            scaledIn: false,
+            creatorExit: false,
+            spent,
+            firstFillPrice: Number(spent - BigInt(fill.fee_lamports)) / Number(fill.token_amount),
+            ladderActive: !coverage,
+            exitArmed: false,
+          });
+        } else if (!state.positions.has(fill.mint)) {
+          if (entries.get(fill.mint)?.qualifies) completed.add(fill.mint);
+          entries.delete(fill.mint);
+        }
+      }
+
+      const touched = new Map<string, Tape>();
+      for (const event of batch.events) {
+        if (event.event === 'CompleteEvent') {
+          tapes.delete(event.mint);
+          reserveOffsets.delete(event.mint);
+          touched.delete(event.mint);
+          continue;
+        }
+        const price = Number(event.virtual_quote_reserves) / Number(event.virtual_token_reserves);
+        if (event.event === 'CreateEvent') {
+          tapes.set(event.mint, { price, firstPrice: price, flow: [], creator: event.creator, dipSlot: -Infinity });
+          continue;
+        }
+        const tape = tapes.get(event.mint);
+        if (!tape) continue;
+        if (
+          !event.is_buy &&
+          typeof tape.creator === 'string' && tape.creator.length > 0 &&
+          event.user === tape.creator &&
+          /^[1-9][0-9]*$/.test(String(event.token_amount ?? ''))
+        ) {
+          const entry = entries.get(event.mint);
+          // The replay processes chain trades before bot fills in the same slot.
+          if (entry && entry.entryFillSlot < event.slot && state.positions.has(event.mint)) {
+            entry.creatorExit = true;
+          }
+        }
+        if (!touched.has(event.mint)) {
+          tape.firstPrice = tape.price;
+          let expired = 0;
+          while (expired < tape.flow.length && tape.flow[expired].slot < slot - FLOW_SLOTS) expired++;
+          if (expired > 0) tape.flow.splice(0, expired);
+          tape.flow.push({ slot, net: 0, high: price, singleDrop: 0 });
+          touched.set(event.mint, tape);
+        }
+        const current = tape.flow[tape.flow.length - 1];
+        current.net += (event.is_buy ? 1 : -1) * Number(event.quote_amount) / SOL;
+        current.high = Math.max(current.high, price);
+        if (!event.is_buy) current.singleDrop = Math.max(current.singleDrop, 1 - price / tape.price);
+        tape.price = price;
+      }
+
+      const dipDepth = (tape: Tape, currentSlot: number) => {
+        let priorNet = 0;
+        let priorHigh = 0;
+        // Keep the signal slot's selling out of the buying history.
+        for (let i = tape.flow.length - 2; i >= 0; i--) {
+          const flow = tape.flow[i];
+          if (flow.slot < currentSlot - FLOW_SLOTS) break;
+          priorNet += flow.net;
+          priorHigh = Math.max(priorHigh, flow.high);
+        }
+        return priorNet >= params.minPriorNetSol && priorHigh > 0 ? 1 - tape.price / priorHigh : 0;
+      };
+      const dips: { mint: string; depth: number }[] = [];
+      for (const [mint, tape] of touched) {
+        tape.dipSlot = -Infinity;
+        if (tape.price > tape.firstPrice * (1 - MIN_SLOT_DROP)) continue;
+        const curve = state.curves.get(mint)!;
+        if (curve.complete || curve.trades < 5 || slot - (curve.created_slot ?? slot) < MIN_SIGNAL_AGE ||
+            tape.flow.at(-1)!.singleDrop < params.minSingleDrop ||
+            Number(curve.real_quote_reserves) < params.minReserveSol * SOL) continue;
+        const depth = dipDepth(tape, slot);
+        if (depth < MIN_DIP_FROM_HIGH) continue;
+        tape.dipSlot = slot;
+        if (!pending.has(mint) && !state.positions.has(mint) &&
+            slot - (lastSignal.get(mint) ?? -Infinity) >= ENTRY_COOLDOWN) dips.push({ mint, depth });
+      }
+
+      const orders: OrderInput[] = [];
+      const scaleIns: string[] = [];
+      const ladders: string[] = [];
+      const marks = new Map(batch.marks.map((mark) => [mark.mint, mark]));
+      const caps = state.hello.caps;
+      const maxBuy = (mint: string) => {
+        const curve = state.curves.get(mint);
+        if (!curve || curve.complete) return 0n;
+        const mark = marks.get(mint);
+        if (mark) return BigInt(mark.real_quote_reserves) * BigInt(caps.max_order_bps_of_real_reserve) / 10_000n;
+
+        // Only held and pending mints get marks. Keep prior fills in the reserve for re-entries.
+        const offset = reserveOffsets.get(mint);
+        let reserve = curve.real_quote_reserves;
+        if (offset) {
+          const quote = offset.tokens > curve.real_token_reserves
+            ? offset.quote * curve.real_token_reserves / offset.tokens
+            : offset.quote;
+          reserve += quote;
+        }
+        return reserve > 0n ? reserve * BigInt(caps.max_order_bps_of_real_reserve) / 10_000n : 0n;
+      };
+      const sellFeeRate = (state.hello.fees.protocol_bps_fallback + state.hello.fees.creator_bps_fallback) / 10_000;
+      let coverageInFlight = 0;
+      let alphaInFlight = 0;
+      for (const [mint, entry] of entries) {
+        if (entry.coverage) coverageInFlight++;
+        else alphaInFlight++;
+        const position = state.positions.get(mint);
+        if (!position || orders.length >= caps.max_orders_per_batch) continue;
+        const mark = marks.get(mint);
+        if (!mark) continue;
+        const tokens = Number(position.token_amount);
+        const gross = Math.min(Number(mark.real_quote_reserves),
+          tokens * Number(mark.virtual_quote_reserves) / (Number(mark.virtual_token_reserves) + tokens));
+        const netReturn = (gross * (1 - sellFeeRate) - Number(txFee)) / entry.cost - 1;
+        if (entry.creatorExit || entry.exitArmed || slot >= entry.exitSlot ||
+            Math.abs(netReturn) >= params.exitMove) {
+          if (pendingAdds.has(mint)) entry.exitArmed = true;
+          if (!pending.has(mint)) {
+            orders.push({ side: 'sell', mint, token_amount: position.token_amount, max_slippage_bps: 10_000 });
+          }
+          continue;
+        }
+        if (entry.coverage) continue;
+        const price = Number(mark.virtual_quote_reserves) / Number(mark.virtual_token_reserves);
+        const tape = tapes.get(mint);
+        // Carry the last dip signal across replies without a trade on this mint.
+        entry.ladderActive &&= tape !== undefined && slot - tape.dipSlot <= FLOW_SLOTS &&
+          price <= entry.firstFillPrice * 1.01 && dipDepth(tape, slot) >= MIN_DIP_FROM_HIGH &&
+          Number(mark.real_quote_reserves) >= params.minReserveSol * SOL;
+        if (!entry.scaledIn && !pending.has(mint) && slot > entry.entryFillSlot && tape && touched.has(mint) &&
+            tape.flow.at(-1)!.singleDrop >= params.minSingleDrop &&
+            price <= entry.entryPrice * (1 - params.scaleInDrop)) {
+          scaleIns.push(mint);
+        } else if (entry.ladderActive) {
+          ladders.push(mint);
+        }
+      }
+      for (const order of pending.values()) {
+        if (order.side !== 'buy') continue;
+        if (order.client_id.startsWith('cover-')) coverageInFlight++;
+        else if (!pendingAdds.has(order.mint)) alphaInFlight++;
+      }
+
+      let room = caps.max_open_positions - state.committedPositionCount();
+      let cash = state.freeCashLamports() - BigInt(orders.length) * txFee;
+      const sendBuy = (mint: string, spend: bigint, kind: 'cover' | 'dip' | 'add' | 'ladder') => {
+        const opensPosition = kind === 'cover' || kind === 'dip';
+        if (cash < spend + txFee || (opensPosition && room <= 0) ||
+            orders.length >= caps.max_orders_per_batch) return false;
+        orders.push({
+          side: 'buy',
+          mint,
+          quote_lamports: spend,
+          max_slippage_bps: kind === 'cover' ? 100 : params.buySlippageBps,
+          client_id: `${kind}-${batch.seq}-${orders.length}`,
+        });
+        cash -= spend + txFee;
+        if (opensPosition) room--;
+        return true;
+      };
+
+      dips.sort((a, b) => b.depth - a.depth);
+      const buying = new Set<string>();
+      for (const { mint } of dips) {
+        if (alphaInFlight >= MAX_ALPHA_POSITIONS || room <= 0 || budget < COVER_BUDGET) break;
+        const cap = maxBuy(mint);
+        if (cap < COVER_BUDGET) continue;
+        if (!sendBuy(mint, cap < budget ? cap : budget, 'dip')) break;
+        lastSignal.set(mint, slot);
+        buying.add(mint);
+        alphaInFlight++;
+      }
+
+      const remainingLadderBudget = (mint: string) =>
+        ladderBudget - entries.get(mint)!.spent - (pendingAdds.get(mint) ?? 0n);
+      for (const mint of scaleIns) {
+        const reserveCap = maxBuy(mint);
+        const cap = remainingLadderBudget(mint);
+        let spend = reserveCap < budget ? reserveCap : budget;
+        if (cap < spend) spend = cap;
+        if (spend >= COVER_BUDGET) sendBuy(mint, spend, 'add');
+      }
+      for (const mint of ladders) {
+        const reserveCap = maxBuy(mint) * 98n / 100n;
+        const cap = remainingLadderBudget(mint);
+        const spend = reserveCap < cap ? reserveCap : cap;
+        if (spend > txFee) sendBuy(mint, spend, 'ladder');
+      }
+
+      // A tiny, immediate round trip on a quiet curve uses little exposure and few fees.
+      if (completed.size + coverageInFlight < COVER_TARGET && room > 0) {
+        for (const [mint, curve] of state.curves) {
+          if (completed.size + coverageInFlight >= COVER_TARGET || room <= 0) break;
+          if (curve.complete || curve.trades < 3 || slot - curve.reserves_slot < 8 ||
+              slot - (curve.created_slot ?? slot) < MIN_COVER_AGE || completed.has(mint) || buying.has(mint) ||
+              state.positions.has(mint) || pending.has(mint) || maxBuy(mint) < COVER_BUDGET) continue;
+          if (!sendBuy(mint, COVER_BUDGET, 'cover')) break;
+          coverageInFlight++;
+        }
+      }
+      return orders;
+    },
+    onDone() {},
+  };
+}

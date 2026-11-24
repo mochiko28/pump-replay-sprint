@@ -95,7 +95,7 @@ function config(manifest: Manifest): { hello: Hello; guardrails: Guardrails } {
   };
 }
 
-function readWindows(manifest: Manifest, count: number, selected: Set<number>): Map<number, Window> {
+function readWindows(data: string, manifest: Manifest, count: number, selected: Set<number>): Map<number, Window> {
   const { start_slot, end_slot, first_block_time, last_block_time } = manifest.window;
   // Start each split with its own cash and universe. A mint must have a create in the split.
   const windows = new Map<number, Window>();
@@ -111,7 +111,7 @@ function readWindows(manifest: Manifest, count: number, selected: Set<number>): 
   let batch: SlotEvents | undefined;
 
   for (const file of manifest.files) {
-    const lines = gunzipSync(readFileSync(resolve(kit, 'dataset', file.path))).toString('utf8').trimEnd().split('\n');
+    const lines = gunzipSync(readFileSync(resolve(data, file.path))).toString('utf8').trimEnd().split('\n');
     if (lines.length !== file.events) throw new Error(`Unexpected event count in ${file.path}`);
     for (const line of lines) {
       const event = JSON.parse(line) as ChainEvent;
@@ -145,7 +145,7 @@ function readWindows(manifest: Manifest, count: number, selected: Set<number>): 
   return windows;
 }
 
-const usage = 'Usage: node tools/sim.ts --strategy strategies/<name>.ts [--params JSON] [--window k/n | --windows n]';
+const usage = 'Usage: node tools/sim.ts --strategy strategies/<name>.ts [--data DIR] [--params JSON] [--window k/n | --windows n]';
 
 function positiveInteger(value: string, flag: string): number {
   const n = Number(value);
@@ -157,6 +157,7 @@ async function main() {
   const { values } = parseArgs({
     options: {
       strategy: { type: 'string' },
+      data: { type: 'string', default: resolve(kit, 'dataset') },
       params: { type: 'string', default: '{}' },
       window: { type: 'string' },
       windows: { type: 'string' },
@@ -188,9 +189,9 @@ async function main() {
     createStrategy?: (params: unknown) => Bot;
   };
   if (typeof createStrategy !== 'function') throw new Error('Strategy must export createStrategy(params)');
-  const manifest = readJson<Manifest>(resolve(kit, 'dataset/manifest.json'));
+  const manifest = readJson<Manifest>(resolve(values.data, 'manifest.json'));
   const { hello, guardrails } = config(manifest);
-  const windows = readWindows(manifest, count, new Set(selected));
+  const windows = readWindows(values.data, manifest, count, new Set(selected));
 
   const results: Awaited<ReturnType<typeof replay>>[] = [];
   for (const index of selected) {
