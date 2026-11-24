@@ -1,12 +1,14 @@
 import { createHash } from 'node:crypto';
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { parseArgs } from 'node:util';
 import { gunzipSync } from 'node:zlib';
 import { PROTOCOL, type Bot, type ChainEvent, type Hello } from '../vendor/makefun-bot.ts';
 import { replay, type Guardrails, type SlotEvents } from './replay.ts';
 import {
   createScoredStrategy, DEFAULT_PARAMS, EntryFeatures, FEATURE_NAMES, predict, treeValue, type ScoreModel, type Tree,
 } from '../strategies/famG.ts';
+import { EntrySignals } from '../strategies/famJ.ts';
 
 const kit = '/work/kit';
 const data = resolve(kit, 'dataset');
@@ -32,11 +34,11 @@ interface Window {
   endSlot: number;
 }
 
-function readJson<T>(path: string): T {
+export function readJson<T>(path: string): T {
   return JSON.parse(readFileSync(path, 'utf8')) as T;
 }
 
-function config(manifest: Manifest): { hello: Hello; guardrails: Guardrails } {
+export function config(manifest: Manifest): { hello: Hello; guardrails: Guardrails } {
   const identity = readJson<{ seed_key?: string; bundle_sha256: string; phase: string; dataset_sha256: string }>(
     resolve(kit, 'kit.json'),
   );
@@ -104,7 +106,7 @@ function config(manifest: Manifest): { hello: Hello; guardrails: Guardrails } {
   };
 }
 
-function readWindows(data: string, manifest: Manifest, count: number, selected: Set<number>): Map<number, Window> {
+export function readWindows(data: string, manifest: Manifest, count: number, selected: Set<number>): Map<number, Window> {
   const { start_slot, end_slot, first_block_time, last_block_time } = manifest.window;
   // Start each split with its own cash and universe. A mint must have a create in the split.
   const windows = new Map<number, Window>();
@@ -195,10 +197,10 @@ async function eventRows(quarter: number, window: Window, hello: Hello, guardrai
     for (const [mint, tape] of touched) {
       const features = study.features(slot, tape);
       if (!features) continue;
-      const label = completed.has(mint) ? null : await tradeLabel(
+      const result = completed.has(mint) ? null : await tradeLabel(
         window, i, creates.get(mint)!, trades.get(mint)!, eventsByMint.get(mint)!, labelHello, guardrails,
       );
-      rows.push({ quarter, slot, mint, features, label });
+      rows.push({ quarter, slot, mint, features, label: result?.netReturn ?? null });
     }
   }
   return rows;
@@ -206,12 +208,13 @@ async function eventRows(quarter: number, window: Window, hello: Hello, guardrai
 
 async function tradeLabel(
   window: Window, start: number, create: Create, lastTrade: Trade, bySlot: Map<number, ChainEvent[]>,
-  hello: Hello, guardrails: Guardrails,
-): Promise<number | null> {
+  hello: Hello, guardrails: Guardrails, fixedHold?: number,
+): Promise<{ netReturn: number; pnlSol: number; filled: boolean } | null> {
   const mint = create.mint;
   const slot = window.batches[start].slot;
   const budget = Math.min(SOL, Math.floor(Number(lastTrade.real_quote_reserves) * hello.caps.max_order_bps_of_real_reserve / 10_000));
   if (budget === 0 || slot + hello.latency_slots > window.endSlot) return null;
+  if (fixedHold !== undefined && slot + 2 * hello.latency_slots + fixedHold > window.endSlot) return null;
 
   let buyCost = 0;
   let entrySlot = 0;
@@ -242,7 +245,10 @@ async function tradeLabel(
       const gross = Math.min(Number(mark.real_quote_reserves),
         tokens * Number(mark.virtual_quote_reserves) / (Number(mark.virtual_token_reserves) + tokens));
       const netReturn = (gross * 0.9875 - Number(state.txFeeLamports())) / buyCost - 1;
-      if (creatorExit || batch.slot >= entrySlot + DEFAULT_PARAMS.holdSlots || Math.abs(netReturn) >= DEFAULT_PARAMS.exitMove) {
+      const due = fixedHold === undefined
+        ? creatorExit || batch.slot >= entrySlot + DEFAULT_PARAMS.holdSlots || Math.abs(netReturn) >= DEFAULT_PARAMS.exitMove
+        : batch.slot >= entrySlot + fixedHold;
+      if (due) {
         return [{ side: 'sell', mint, token_amount: position.token_amount, max_slippage_bps: 10_000 }];
       }
       return [];
@@ -262,8 +268,61 @@ async function tradeLabel(
     if (!done && window.batches.at(-1)!.slot < window.endSlot) yield { slot: window.endSlot, events: [] };
   }
   await replay(bot, hello, guardrails, batches(), window.endSlot);
-  // A rejected buy made no cash flow or position.
-  return buyCost ? (finalCash - Number(hello.capital.lamports)) / buyCost : 0;
+  const pnl = finalCash - Number(hello.capital.lamports);
+  return { netReturn: buyCost ? pnl / buyCost : 0, pnlSol: pnl / SOL, filled: buyCost > 0 };
+}
+
+async function liveStudy() {
+  const { values } = parseArgs({ args: process.argv.slice(3), options: {
+    data: { type: 'string', default: '/work/.tmp/live-replay1' },
+    output: { type: 'string' },
+  } });
+  const manifest = readJson<Manifest>(resolve(values.data, 'manifest.json'));
+  const { hello, guardrails } = config(manifest);
+  hello.latency_slots = 2;
+  hello.caps.max_order_bps_of_real_reserve = 100;
+  Object.assign(hello.fees, { protocol_bps_fallback: 95, creator_bps_fallback: 30, failed_tx_bps: 0 });
+  const window = readWindows(values.data, manifest, 2, new Set([0])).get(0)!;
+  const creates = new Map<string, Create>();
+  const eventsByMint = new Map<string, Map<number, ChainEvent[]>>();
+  for (const { slot, events } of window.batches) {
+    for (const event of events) {
+      if (event.event === 'CreateEvent') creates.set(event.mint, event);
+      let bySlot = eventsByMint.get(event.mint);
+      if (!bySlot) eventsByMint.set(event.mint, bySlot = new Map());
+      let mintEvents = bySlot.get(slot);
+      if (!mintEvents) bySlot.set(slot, mintEvents = []);
+      mintEvents.push(event.event === 'TradeEvent' ? {
+        ...event, fee_basis_points: '95', creator_fee_basis_points: '30',
+      } : event);
+    }
+  }
+  const detector = new EntrySignals();
+  const rows = [];
+  for (const [i, { slot, events }] of window.batches.entries()) {
+    for (const [mint, opportunities] of detector.update(events)) {
+      const { age, reserve, trade } = opportunities[0];
+      const reserveBucket = reserve < 4 ? '1–4' : reserve < 8 ? '4–8' : reserve < 25 ? '8–25' : '25+';
+      const ageBucket = age < 32 ? '0–31' : age < 120 ? '32–119' : age < 600 ? '120–599' : '600+';
+      for (const hold of [12, 36, 112, 240]) {
+        const result = await tradeLabel(window, i, creates.get(mint)!, trade, eventsByMint.get(mint)!, hello, guardrails, hold);
+        if (!result) continue;
+        for (const { signal } of opportunities) {
+          rows.push({ signal, mint, slot, reserve, age, reserveBucket, ageBucket, hold, ...result });
+        }
+      }
+    }
+  }
+  const groups = Map.groupBy(rows, ({ signal, reserveBucket, ageBucket, hold }) => JSON.stringify([signal, reserveBucket, ageBucket, hold]));
+  for (const [key, rows] of groups) {
+    const [signal, reserveBucket, ageBucket, hold] = JSON.parse(key);
+    const filled = rows.filter((row) => row.filled);
+    console.log(JSON.stringify({ signal, reserveBucket, ageBucket, hold, signals: rows.length, fills: filled.length,
+      mints: new Set(filled.map((row) => row.mint)).size,
+      meanNetReturn: filled.length ? mean(filled.map((row) => row.netReturn)) : null,
+      pnlSol: filled.reduce((total, row) => total + row.pnlSol, 0) }));
+  }
+  if (values.output) writeFileSync(values.output, JSON.stringify(rows) + '\n');
 }
 
 type Observation = Row & { label: number };
@@ -420,4 +479,4 @@ async function main() {
   console.log(JSON.stringify({ minScore: winner.minScore, model: fitTrees(observed) }));
 }
 
-await main();
+if (import.meta.main) await (process.argv[2] === 'live' ? liveStudy() : main());
